@@ -6,6 +6,7 @@ Usage examples:
   python utils/data_pre_process/download_wanted.py --datasets all
 
 Notes:
+  - The script auto-loads REPO_ROOT/.env for tokens (HF/Kaggle).
   - `foursquare_os_places` is gated on Hugging Face and requires accepted terms.
   - `yelp` is distributed on Kaggle and requires Kaggle API credentials.
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -26,6 +28,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW_ROOT = REPO_ROOT / "dataset" / "raw"
+DEFAULT_ENV_FILE = REPO_ROOT / ".env"
 
 
 SUPPORTED_DATASETS = (
@@ -55,6 +58,52 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
+def _strip_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _load_env_file(env_file: Path) -> None:
+    if not env_file.exists():
+        return
+
+    # Prefer python-dotenv if available, fallback to lightweight parser.
+    try:
+        from dotenv import load_dotenv  # type: ignore
+
+        load_dotenv(dotenv_path=env_file, override=False)
+        _log(f"Loaded env from: {env_file}")
+        return
+    except ImportError:
+        pass
+
+    loaded = 0
+    with env_file.open("r", encoding="utf-8") as fin:
+        for raw_line in fin:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            value = _strip_quotes(value.strip())
+            os.environ.setdefault(key, value)
+            loaded += 1
+    if loaded:
+        _log(f"Loaded env from: {env_file} (built-in parser)")
+
+
+def _normalize_env_aliases() -> None:
+    # Kaggle CLI expects KAGGLE_KEY. Allow KAGGLE_API_TOKEN as alias.
+    kaggle_api_token = os.environ.get("KAGGLE_API_TOKEN")
+    kaggle_key = os.environ.get("KAGGLE_KEY")
+    if kaggle_api_token and not kaggle_key:
+        os.environ["KAGGLE_KEY"] = kaggle_api_token
+        _log("Mapped env alias: KAGGLE_API_TOKEN -> KAGGLE_KEY")
+
+
 def _download_to_file(urls: list[str], output_path: Path, timeout: int, force: bool) -> None:
     if output_path.exists() and not force:
         _log(f"  Skip existing file: {output_path.name}")
@@ -69,11 +118,28 @@ def _download_to_file(urls: list[str], output_path: Path, timeout: int, force: b
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "QUAM-Eval/Downloader"})
             with urllib.request.urlopen(req, timeout=timeout) as response, temp_path.open("wb") as fout:
+                expected_length_raw = response.headers.get("Content-Length")
+                expected_length = int(expected_length_raw) if expected_length_raw and expected_length_raw.isdigit() else None
+                written = 0
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     fout.write(chunk)
+                    written += len(chunk)
+
+            if expected_length is not None and written != expected_length:
+                raise OSError(
+                    f"Incomplete download for {output_path.name}: expected {expected_length} bytes, got {written} bytes."
+                )
+
+            if output_path.suffix.lower() == ".zip":
+                try:
+                    with zipfile.ZipFile(temp_path, "r") as zf:
+                        zf.infolist()
+                except zipfile.BadZipFile as exc:
+                    raise OSError(f"Downloaded file is not a valid ZIP archive: {output_path.name}") from exc
+
             temp_path.replace(output_path)
             _log(f"  Saved to: {output_path}")
             return
@@ -126,7 +192,15 @@ def download_foursquare_classic(args: argparse.Namespace) -> None:
         "http://www-public.tem-tsp.eu/~zhang_da/pub/dataset_tsmc2014.zip",
         "http://www-public.it-sudparis.eu/~zhang_da/pub/dataset_tsmc2014.zip",
     ]
-    _download_to_file(urls, archive_path, timeout=args.timeout, force=args.force)
+    force_download = args.force
+    if archive_path.exists() and not force_download:
+        try:
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                zf.infolist()
+        except zipfile.BadZipFile:
+            _log("  Existing archive is corrupted; redownloading...")
+            force_download = True
+    _download_to_file(urls, archive_path, timeout=args.timeout, force=force_download)
 
     if args.extract:
         _log("  Extracting archive...")
@@ -166,7 +240,7 @@ def download_foursquare_os_places(args: argparse.Namespace) -> None:
     except ImportError as exc:
         raise RuntimeError(
             "huggingface_hub is required for foursquare_os_places. "
-            "Install with: pip install huggingface_hub"
+            "Install with: python -m pip install huggingface_hub"
         ) from exc
 
     token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
@@ -180,7 +254,17 @@ def download_foursquare_os_places(args: argparse.Namespace) -> None:
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
     api = HfApi(token=token)
-    all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    try:
+        all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).strip()
+        lowered = msg.lower()
+        if "10013" in lowered or "forbidden by its access permissions" in lowered:
+            raise RuntimeError(
+                "Network/socket access to Hugging Face is blocked (WinError 10013). "
+                "Please check proxy, firewall, VPN, or corporate network policy."
+            ) from exc
+        raise RuntimeError(f"Failed to query FSQ repository file list: {msg}") from exc
     dates = sorted(
         {
             path.split("/")[1].split("=")[1]
@@ -197,26 +281,62 @@ def download_foursquare_os_places(args: argparse.Namespace) -> None:
             f"Requested --fsq-os-date={selected_date} not found. Available latest date: {dates[-1]}"
         )
 
-    allow_patterns = [
-        f"release/dt={selected_date}/places/parquet/*.parquet",
-        f"release/dt={selected_date}/categories/parquet/*.parquet",
-        "README.md",
-    ]
-    if args.include_deltas:
-        allow_patterns.append(f"release/dt={selected_date}/deltas/parquet/*.parquet")
+    places_prefix = f"release/dt={selected_date}/places/parquet/"
+    categories_prefix = f"release/dt={selected_date}/categories/parquet/"
+    deltas_prefix = f"release/dt={selected_date}/deltas/parquet/"
+
+    place_files = [path for path in all_files if path.startswith(places_prefix) and path.endswith(".parquet")]
+    category_files = [path for path in all_files if path.startswith(categories_prefix) and path.endswith(".parquet")]
+    delta_files = [path for path in all_files if path.startswith(deltas_prefix) and path.endswith(".parquet")]
+
+    if not place_files or not category_files:
+        raise RuntimeError(
+            "Could not find expected FSQ files on Hugging Face for "
+            f"dt={selected_date}. Check token permission and accepted dataset terms."
+        )
+
+    selected_files = sorted(place_files + category_files)
+    if args.include_deltas and delta_files:
+        selected_files.extend(sorted(delta_files))
+    selected_files.append("README.md")
 
     _log(
         f"  Downloading foursquare/fsq-os-places release dt={selected_date} "
-        f"(include_deltas={args.include_deltas})"
+        f"(include_deltas={args.include_deltas}, files={len(selected_files)})"
     )
-    snapshot_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        local_dir=str(dataset_dir),
-        token=token,
-        allow_patterns=allow_patterns,
-        local_dir_use_symlinks=False,
-        resume_download=True,
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            local_dir=str(dataset_dir),
+            token=token,
+            allow_patterns=selected_files,
+        )
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).strip()
+        lowered = msg.lower()
+        if "gated" in lowered or "403" in lowered or "forbidden" in lowered:
+            raise RuntimeError(
+                "FSQ dataset is gated. Ensure your HF account accepted the dataset terms and the token has access."
+            ) from exc
+        if "local cache" in lowered or "cannot find the requested files" in lowered:
+            raise RuntimeError(
+                "Failed to download FSQ files from Hub (connection or access issue). "
+                "Please verify HF_TOKEN, accepted terms, and network connectivity."
+            ) from exc
+        raise RuntimeError(f"FSQ download failed: {msg}") from exc
+
+
+def _resolve_kaggle_command(kaggle_cmd: str) -> list[str]:
+    if shutil.which(kaggle_cmd):
+        return [kaggle_cmd]
+
+    if importlib.util.find_spec("kaggle") is not None:
+        return [sys.executable, "-m", "kaggle"]
+
+    raise RuntimeError(
+        "Kaggle CLI not found. Install with: python -m pip install kaggle "
+        "and ensure Kaggle credentials are configured."
     )
 
 
@@ -224,7 +344,8 @@ def download_yelp(args: argparse.Namespace) -> None:
     dataset_dir = RAW_ROOT / "yelp"
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [args.kaggle_cmd, "datasets", "download", "-d", args.kaggle_dataset, "-p", str(dataset_dir)]
+    kaggle_cmd = _resolve_kaggle_command(args.kaggle_cmd)
+    cmd = kaggle_cmd + ["datasets", "download", "-d", args.kaggle_dataset, "-p", str(dataset_dir)]
     if args.extract:
         cmd.append("--unzip")
 
@@ -288,6 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--list", action="store_true", help="List supported datasets and exit.")
+    parser.add_argument(
+        "--env-file",
+        default=str(DEFAULT_ENV_FILE),
+        help="Path to .env file used to load tokens/credentials.",
+    )
     parser.add_argument("--timeout", type=int, default=180, help="HTTP timeout seconds for direct downloads.")
     parser.add_argument("--force", action="store_true", help="Redownload files even if target exists.")
     parser.add_argument("--keep-archive", action="store_true", help="Keep downloaded .zip/.gz files.")
@@ -335,6 +461,9 @@ def main() -> int:
     if args.list:
         print("\n".join(SUPPORTED_DATASETS))
         return 0
+
+    _load_env_file(Path(args.env_file))
+    _normalize_env_aliases()
 
     try:
         datasets = _normalize_dataset_tokens(args.datasets)
