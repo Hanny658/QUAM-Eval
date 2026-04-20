@@ -6,8 +6,7 @@ Usage examples:
   python utils/data_pre_process/download_wanted.py --datasets all
 
 Notes:
-  - The script auto-loads REPO_ROOT/.env for tokens (HF/Kaggle).
-  - `foursquare_os_places` is gated on Hugging Face and requires accepted terms.
+  - The script auto-loads REPO_ROOT/.env for credentials.
   - `yelp` is distributed on Kaggle and requires Kaggle API credentials.
 """
 
@@ -33,7 +32,6 @@ DEFAULT_ENV_FILE = REPO_ROOT / ".env"
 
 SUPPORTED_DATASETS = (
     "foursquare_classic",
-    "foursquare_os_places",
     "gowalla",
     "yelp",
 )
@@ -45,10 +43,6 @@ ALIASES = {
     "foursquare_classic": "foursquare_classic",
     "foursquare-classic": "foursquare_classic",
     "tsmc2014": "foursquare_classic",
-    "foursquare_os_places": "foursquare_os_places",
-    "foursquare-os-places": "foursquare_os_places",
-    "fsq_os_places": "foursquare_os_places",
-    "fsq-os-places": "foursquare_os_places",
     "gowalla": "gowalla",
     "yelp": "yelp",
 }
@@ -234,99 +228,6 @@ def download_gowalla(args: argparse.Namespace) -> None:
             _log(f"  Removed archive: {gzip_path.name}")
 
 
-def download_foursquare_os_places(args: argparse.Namespace) -> None:
-    try:
-        from huggingface_hub import HfApi, snapshot_download
-    except ImportError as exc:
-        raise RuntimeError(
-            "huggingface_hub is required for foursquare_os_places. "
-            "Install with: python -m pip install huggingface_hub"
-        ) from exc
-
-    token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "HF token is required. Pass --hf-token or set HF_TOKEN/HUGGINGFACEHUB_API_TOKEN."
-        )
-
-    repo_id = "foursquare/fsq-os-places"
-    dataset_dir = RAW_ROOT / "foursquare_os_places"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-
-    api = HfApi(token=token)
-    try:
-        all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
-    except Exception as exc:  # noqa: BLE001
-        msg = str(exc).strip()
-        lowered = msg.lower()
-        if "10013" in lowered or "forbidden by its access permissions" in lowered:
-            raise RuntimeError(
-                "Network/socket access to Hugging Face is blocked (WinError 10013). "
-                "Please check proxy, firewall, VPN, or corporate network policy."
-            ) from exc
-        raise RuntimeError(f"Failed to query FSQ repository file list: {msg}") from exc
-    dates = sorted(
-        {
-            path.split("/")[1].split("=")[1]
-            for path in all_files
-            if path.startswith("release/dt=") and len(path.split("/")) > 2
-        }
-    )
-    if not dates:
-        raise RuntimeError("Cannot find release dates from Hugging Face dataset repository.")
-
-    selected_date = dates[-1] if args.fsq_os_date == "latest" else args.fsq_os_date
-    if selected_date not in dates:
-        raise RuntimeError(
-            f"Requested --fsq-os-date={selected_date} not found. Available latest date: {dates[-1]}"
-        )
-
-    places_prefix = f"release/dt={selected_date}/places/parquet/"
-    categories_prefix = f"release/dt={selected_date}/categories/parquet/"
-    deltas_prefix = f"release/dt={selected_date}/deltas/parquet/"
-
-    place_files = [path for path in all_files if path.startswith(places_prefix) and path.endswith(".parquet")]
-    category_files = [path for path in all_files if path.startswith(categories_prefix) and path.endswith(".parquet")]
-    delta_files = [path for path in all_files if path.startswith(deltas_prefix) and path.endswith(".parquet")]
-
-    if not place_files or not category_files:
-        raise RuntimeError(
-            "Could not find expected FSQ files on Hugging Face for "
-            f"dt={selected_date}. Check token permission and accepted dataset terms."
-        )
-
-    selected_files = sorted(place_files + category_files)
-    if args.include_deltas and delta_files:
-        selected_files.extend(sorted(delta_files))
-    selected_files.append("README.md")
-
-    _log(
-        f"  Downloading foursquare/fsq-os-places release dt={selected_date} "
-        f"(include_deltas={args.include_deltas}, files={len(selected_files)})"
-    )
-    try:
-        snapshot_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            local_dir=str(dataset_dir),
-            token=token,
-            allow_patterns=selected_files,
-        )
-    except Exception as exc:  # noqa: BLE001
-        msg = str(exc).strip()
-        lowered = msg.lower()
-        if "gated" in lowered or "403" in lowered or "forbidden" in lowered:
-            raise RuntimeError(
-                "FSQ dataset is gated. Ensure your HF account accepted the dataset terms and the token has access."
-            ) from exc
-        if "local cache" in lowered or "cannot find the requested files" in lowered:
-            raise RuntimeError(
-                "Failed to download FSQ files from Hub (connection or access issue). "
-                "Please verify HF_TOKEN, accepted terms, and network connectivity."
-            ) from exc
-        raise RuntimeError(f"FSQ download failed: {msg}") from exc
-
-
 def _resolve_kaggle_command(kaggle_cmd: str) -> list[str]:
     if shutil.which(kaggle_cmd):
         return [kaggle_cmd]
@@ -363,7 +264,6 @@ def download_yelp(args: argparse.Namespace) -> None:
 
 DOWNLOAD_HANDLERS = {
     "foursquare_classic": download_foursquare_classic,
-    "foursquare_os_places": download_foursquare_os_places,
     "gowalla": download_gowalla,
     "yelp": download_yelp,
 }
@@ -405,7 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=["all"],
         help=(
             "Dataset names (space/comma separated). "
-            "Supported: foursquare_classic, foursquare_os_places, gowalla, yelp, all"
+            "Supported: foursquare_classic, gowalla, yelp, all"
         ),
     )
     parser.add_argument("--list", action="store_true", help="List supported datasets and exit.")
@@ -424,22 +324,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not extract downloaded archives.",
     )
     parser.set_defaults(extract=True)
-
-    parser.add_argument(
-        "--hf-token",
-        default=None,
-        help="Hugging Face token for foursquare_os_places (fallback: HF_TOKEN env var).",
-    )
-    parser.add_argument(
-        "--fsq-os-date",
-        default="latest",
-        help="Release date for foursquare_os_places in YYYY-MM-DD format, or latest.",
-    )
-    parser.add_argument(
-        "--include-deltas",
-        action="store_true",
-        help="Also download deltas parquet for foursquare_os_places.",
-    )
 
     parser.add_argument(
         "--kaggle-cmd",
