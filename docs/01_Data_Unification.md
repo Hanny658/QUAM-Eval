@@ -31,7 +31,7 @@ social network information.
 | `active_days` | int32 | no | Distinct active local dates. |
 | `home_lat` | float64 | no | Mean latitude inferred from user interactions. |
 | `home_lon` | float64 | no | Mean longitude inferred from user interactions. |
-| `profile_json` | string (JSON) | no | Dataset-specific profile payload (stats/metadata). |
+| `profile_json` | string (JSON) | no | Query-oriented profile payload. See `docs/02-User_Profile.md`. |
 
 #### `pois`
 
@@ -131,8 +131,10 @@ Dataset-specific parsing is implemented in:
 
 1. resolve dataset/file args
 2. invoke adapters
-3. write unified outputs
-4. generate metadata manifest
+3. filter low-activity users/interactions by threshold
+4. build query-oriented user profile payloads
+5. write unified outputs
+6. generate metadata manifest
 
 ### CLI
 

@@ -21,6 +21,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.data_pre_process.adapters import adapt_fsq_2014, adapt_gowalla, adapt_yelp_2024
+from utils.data_pre_process.adapters.common import (
+    build_query_user_profiles,
+    filter_tables_by_min_interactions,
+)
 
 DEFAULT_RAW_ROOT = REPO_ROOT / "dataset" / "raw"
 DEFAULT_OUT_ROOT = REPO_ROOT / "dataset" / "unified" / "v1"
@@ -51,6 +55,9 @@ TABLE_NAMES = (
 )
 
 SCHEMA_VERSION = "phase1-v1"
+PROFILE_MIN_INTERACTIONS = 10
+PROFILE_SESSION_GAP_HOURS = 6
+PROFILE_TOPK_CATEGORIES = 20
 
 
 def _log(message: str) -> None:
@@ -349,6 +356,23 @@ def main() -> int:
                 selected_files=dataset_selected_files if dataset_selected_files else None,
                 limit=args.limit,
                 strict=args.strict,
+            )
+            filtered = filter_tables_by_min_interactions(
+                tables=result.tables,
+                min_interactions=PROFILE_MIN_INTERACTIONS,
+            )
+            _log(
+                "  Filtered users/interactions by threshold "
+                f"{PROFILE_MIN_INTERACTIONS}: "
+                f"users {filtered['users_before']}->{filtered['users_after']}, "
+                f"interactions {filtered['interactions_before']}->{filtered['interactions_after']}"
+            )
+            build_query_user_profiles(
+                dataset=dataset_name,
+                tables=result.tables,
+                min_interactions=PROFILE_MIN_INTERACTIONS,
+                session_gap_hours=PROFILE_SESSION_GAP_HOURS,
+                topk_categories=PROFILE_TOPK_CATEGORIES,
             )
             table_counts = _write_tables(
                 out_root=out_root,
